@@ -175,3 +175,18 @@ notebooks/
 gold.*.json
 loose-ends.txt
 todo_later.txt
+
+# SWE-bench evaluation outputs
+/logs/
+/logs/inference/
+/logs/evaluation/
+/logs/build_images/
+
+# Inference outputs (predictions, trajectories)
+/outputs/
+
+# Task repo (cloned by run_swebench_verified.sh)
+/swe-bench-tasks/
+
+# Auto-generated model config (run_swebench_verified.sh)
+/model_config.yaml
