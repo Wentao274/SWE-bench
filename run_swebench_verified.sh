@@ -14,7 +14,7 @@ set -euo pipefail
 #
 # 用法：
 #   1. 修改下方 =====配置区===== 中的变量
-#   2. bash run_swebench_verified.sh
+#   2. ./run_swebench_verified.sh
 #
 # 可选参数：
 #   --skip-install      跳过安装步骤（已安装过时使用）
@@ -60,7 +60,7 @@ DATASET="verified"                 # verified | lite | full | multimodal | multi
 SPLIT="test"
 
 # 每个实例超时（秒）
-EVAL_TIMEOUT=1800
+EVAL_TIMEOUT=3600
 
 # ============================ 配置区结束 =====================================
 
@@ -139,16 +139,23 @@ fi
 log_info "Docker 正常: $(docker --version)"
 
 # 检查 Python（uv 会管理，但确认 uv 能找到 Python）
-if ! uv python find &>/dev/null; then
+log_info "检查 Python 环境..."
+if ! timeout 30 uv python find &>/dev/null; then
     log_warn "uv 未找到可用 Python，尝试安装..."
-    uv python install 3.12 || {
+    timeout 120 uv python install 3.12 || {
         log_error "无法安装 Python，请手动安装 Python >= 3.10"
         exit 1
     }
 fi
-PY_VERSION=$(uv run python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0")
+# uv run 首次会自动触发 uv sync（下载依赖），可能耗时较长
+log_info "探测 Python 版本（首次执行可能触发 uv sync，请耐心等待）..."
+PY_VERSION=$(timeout 300 uv run python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0")
 log_info "Python 版本: ${PY_VERSION}"
-if uv run python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+if [[ "$PY_VERSION" == "0" ]]; then
+    log_error "无法运行 uv run python，请手动执行 'uv sync --extra datasets' 检查依赖安装"
+    exit 1
+fi
+if timeout 30 uv run python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
     log_info "Python 版本满足要求 (>= 3.10)"
 else
     log_error "Python 版本过低！需要 >= 3.10，当前 ${PY_VERSION}"
