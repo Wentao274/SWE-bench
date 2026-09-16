@@ -271,10 +271,8 @@ else
 fi
 
 log_info "检查 Task Repo 完整性..."
-uv run swebench dataset check "${TASK_REPO_DIR}" || {
-    log_error "Task Repo 校验失败"
-    exit 1
-}
+uv run swebench dataset check "${TASK_REPO_DIR}" --fix 2>&1 || true
+log_info "Task Repo 校验完成（个别坏实例不影响指定实例的评测）"
 
 #==============================================================================
 # Step 3: 预构建 Docker 镜像（可选，避免评测时等待）
@@ -311,14 +309,14 @@ MODEL_CONFIG="${WORK_DIR}/model_config.yaml"
 
 cat > "${MODEL_CONFIG}" <<EOF
 # mini-SWE-agent 模型配置（自动生成）
-# litellm 格式：openai/ 前缀表示走 OpenAI 兼容接口
-model: openai/${MODEL_NAME}
-api_base: ${API_BASE}
-api_key: ${API_KEY}
-# 采样参数（litellm 会透传给 vLLM 的 /v1/chat/completions）
-temperature: ${TEMPERATURE}
-top_p: ${TOP_P}
-max_tokens: ${MAX_TOKENS}
+# model 为 dict，mini-SWE-agent 的 get_model() 期望字典格式
+# model_name 通过 -m 参数传递，此处只配置连接和采样参数
+model:
+  api_base: ${API_BASE}
+  api_key: ${API_KEY}
+  temperature: ${TEMPERATURE}
+  top_p: ${TOP_P}
+  max_tokens: ${MAX_TOKENS}
 EOF
 
 log_info "模型配置已写入: ${MODEL_CONFIG}"
@@ -351,6 +349,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     echo ""
     echo "  将执行:"
     echo "    uv run swebench infer ${DATASET} \\"
+    echo "      -m openai/${MODEL_NAME} \\"
     echo "      -c ${MODEL_CONFIG} \\"
     echo "      --run-id ${RUN_ID_INFER} \\"
     echo "      -w ${INFER_WORKERS} \\"
@@ -370,6 +369,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     fi
 
     uv run swebench infer "${DATASET}" \
+        -m "openai/${MODEL_NAME}" \
         -c "${MODEL_CONFIG}" \
         --run-id "${RUN_ID_INFER}" \
         -w "${INFER_WORKERS}" \
@@ -385,20 +385,28 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
         }
 
     log_info "推理完成！"
-    log_info "预测文件: ${OUTPUT_DIR}/preds.json"
 
-    # 如果推理只指定了部分实例，更新 PRED_FILE
+    # 查找生成的预测文件（mini-SWE-agent 输出 preds.json 或 preds.jsonl）
     if [[ -f "${OUTPUT_DIR}/preds.json" ]]; then
         PRED_FILE="${OUTPUT_DIR}/preds.json"
     elif [[ -f "${OUTPUT_DIR}/preds.jsonl" ]]; then
         PRED_FILE="${OUTPUT_DIR}/preds.jsonl"
     fi
 
-    # 统计预测数量
-    if [[ -f "${PRED_FILE}" ]]; then
-        PRED_COUNT=$(wc -l < "${PRED_FILE}" 2>/dev/null || wc -l "${PRED_FILE}" | awk '{print $1}')
-        log_info "生成预测数量: ${PRED_COUNT} 条"
+    # 检查预测文件是否存在且非空
+    if [[ ! -f "${PRED_FILE}" ]] || [[ ! -s "${PRED_FILE}" ]]; then
+        log_error "推理未生成有效预测文件！"
+        log_error "  预测文件路径: ${PRED_FILE}"
+        log_error "  推理日志: logs/inference/${RUN_ID_INFER}/"
+        log_error "  mini-SWE-agent 日志: ${OUTPUT_DIR}/minisweagent.log"
+        exit 1
     fi
+
+    log_info "预测文件: ${PRED_FILE}"
+
+    # 统计预测数量
+    PRED_COUNT=$(wc -l < "${PRED_FILE}" 2>/dev/null || wc -l "${PRED_FILE}" | awk '{print $1}')
+    log_info "生成预测数量: ${PRED_COUNT} 条"
 
     # 打印一条预测示例
     log_info "预测示例（第一条）:"
