@@ -183,6 +183,15 @@ if ! docker info &>/dev/null; then
 fi
 log_info "Docker 正常: $(docker --version)"
 
+# 检查 Docker buildx（SWE-bench 镜像构建依赖 buildx，无 buildx 时改用 Docker Hub 拉取）
+HAS_BUILDX=false
+if docker buildx version &>/dev/null; then
+    HAS_BUILDX=true
+    log_info "Docker buildx 可用"
+else
+    log_warn "Docker buildx 不可用，将改为从 Docker Hub 拉取预构建镜像"
+fi
+
 # 检查 Python（uv 会管理，但确认 uv 能找到 Python）
 log_info "检查 Python 环境..."
 if ! timeout 30 uv python find &>/dev/null; then
@@ -252,7 +261,7 @@ if [[ "$SKIP_INSTALL" == "false" ]]; then
     uv run swebench --version 2>/dev/null || uv run python -c "import swebench; print(swebench.__version__)" || true
     uv run python -c "import minisweagent; print('mini-SWE-agent OK')" || log_warn "mini-SWE-agent 导入失败，推理步骤可能出错"
     # 检查 litellm 版本兼容性
-    uv run python -c "import litellm; assert hasattr(litellm, 'exceptions'), f'litellm {litellm.__version__} 缺少 exceptions 模块，不兼容 mini-SWE-agent'; print(f'litellm {litellm.__version__} OK')" || log_warn "litellm 版本可能不兼容 mini-SWE-agent"
+    uv run python -c "import litellm; assert hasattr(litellm, 'exceptions'), 'litellm 缺少 exceptions 模块，不兼容 mini-SWE-agent'; print('litellm OK')" || log_warn "litellm 版本可能不兼容 mini-SWE-agent"
 else
     log_step "Step 1: 跳过安装（--skip-install）"
 fi
@@ -279,29 +288,52 @@ uv run swebench dataset check "${TASK_REPO_DIR}" --fix 2>&1 || true
 log_info "Task Repo 校验完成（个别坏实例不影响指定实例的评测）"
 
 #==============================================================================
-# Step 3: 预构建 Docker 镜像（可选，避免评测时等待）
+# Step 3: 准备 Docker 镜像
 #==============================================================================
 if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
-    log_step "Step 3: 预构建 Docker 镜像"
+    log_step "Step 3: 准备 Docker 镜像"
 
-    log_info "从 Task Repo 构建 Docker 镜像（可能需要较长时间）..."
-    log_info "构建参数: -j ${EVAL_WORKERS}"
-    if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
-        BUILD_INSTANCE_ARGS=()
-        for id in "${INSTANCE_IDS[@]}"; do
-            BUILD_INSTANCE_ARGS+=("-i" "$id")
-        done
-        uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}" "${BUILD_INSTANCE_ARGS[@]}" || {
-            log_warn "部分镜像构建失败，评测时会尝试从 registry 拉取"
-        }
+    if [[ "$HAS_BUILDX" == "true" ]]; then
+        # 有 buildx：从 Task Repo 本地构建
+        log_info "从 Task Repo 构建 Docker 镜像（可能需要较长时间）..."
+        log_info "构建参数: -j ${EVAL_WORKERS}"
+        if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+            BUILD_INSTANCE_ARGS=()
+            for id in "${INSTANCE_IDS[@]}"; do
+                BUILD_INSTANCE_ARGS+=("-i" "$id")
+            done
+            uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}" "${BUILD_INSTANCE_ARGS[@]}" || {
+                log_warn "部分镜像构建失败，将尝试从 Docker Hub 拉取"
+            }
+        else
+            uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}" || {
+                log_warn "部分镜像构建失败，将尝试从 Docker Hub 拉取"
+            }
+        fi
+        log_info "Docker 镜像构建完成"
     else
-        uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}" || {
-            log_warn "部分镜像构建失败，评测时会尝试从 registry 拉取"
-        }
+        # 无 buildx：直接从 Docker Hub 拉取预构建镜像
+        log_info "从 Docker Hub 拉取预构建镜像..."
+
+        # 确定需要拉取的镜像名
+        # 镜像名格式: swebench/sweb.eval.x86_64.<instance_id>:latest
+        # 其中 instance_id 的 __ 替换为 _1776_，全小写（见 swebench/task/checks.py:68-69）
+        if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+            for id in "${INSTANCE_IDS[@]}"; do
+                IMAGE_TAG=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
+                IMAGE_NAME="swebench/sweb.eval.x86_64.${IMAGE_TAG}:latest"
+                log_info "拉取镜像: ${IMAGE_NAME}"
+                docker pull "${IMAGE_NAME}" || {
+                    log_warn "拉取失败: ${IMAGE_NAME}，评测时会再次尝试"
+                }
+            done
+        else
+            log_warn "未指定 --instance，跳过预拉取（全量评测时评测步骤会按需拉取）"
+            log_warn "建议先用 --instance 指定少量实例测试"
+        fi
     fi
-    log_info "Docker 镜像构建完成"
 else
-    log_step "Step 3: 跳过镜像预构建（--skip-build 或 --infer-only）"
+    log_step "Step 3: 跳过镜像准备（--skip-build 或 --infer-only）"
 fi
 
 #==============================================================================
@@ -443,9 +475,18 @@ log_info "数据集: ${DATASET} (split: ${SPLIT})"
 log_info "评测并发: ${EVAL_WORKERS}"
 log_info "超时设置: ${EVAL_TIMEOUT}s / 实例"
 log_info "Run ID: ${RUN_ID_EVAL}"
-log_info "Task Repo: ${TASK_REPO_DIR}"
 if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
     log_info "指定实例: ${INSTANCE_IDS[*]}"
+fi
+
+# 构造评测命令
+# 有 buildx 时用 --task-repo 本地构建；无 buildx 时不传 --task-repo，从 Docker Hub 拉取
+EVAL_TASK_REPO_ARGS=()
+if [[ "$HAS_BUILDX" == "true" ]]; then
+    log_info "Task Repo: ${TASK_REPO_DIR}（本地构建镜像）"
+    EVAL_TASK_REPO_ARGS+=(--task-repo "${TASK_REPO_DIR}")
+else
+    log_info "镜像来源: Docker Hub（不传 --task-repo，评测时自动拉取）"
 fi
 
 echo ""
@@ -454,8 +495,10 @@ echo "    uv run swebench eval ${DATASET} \\"
 echo "      -p ${PRED_FILE} \\"
 echo "      --run-id ${RUN_ID_EVAL} \\"
 echo "      -j ${EVAL_WORKERS} \\"
-echo "      -t ${EVAL_TIMEOUT} \\"
-echo "      --task-repo ${TASK_REPO_DIR}"
+echo "      -t ${EVAL_TIMEOUT}"
+if [[ ${#EVAL_TASK_REPO_ARGS[@]} -gt 0 ]]; then
+    echo "      ${EVAL_TASK_REPO_ARGS[0]} ${EVAL_TASK_REPO_ARGS[1]}"
+fi
 if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
     for id in "${INSTANCE_IDS[@]}"; do
         echo "      -i ${id}"
@@ -468,7 +511,7 @@ uv run swebench eval "${DATASET}" \
     --run-id "${RUN_ID_EVAL}" \
     -j "${EVAL_WORKERS}" \
     -t "${EVAL_TIMEOUT}" \
-    --task-repo "${TASK_REPO_DIR}" \
+    "${EVAL_TASK_REPO_ARGS[@]}" \
     "${INSTANCE_ARGS[@]}" || {
         log_error "评测失败！"
         log_error "请检查："
