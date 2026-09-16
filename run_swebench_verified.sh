@@ -293,7 +293,29 @@ log_info "Task Repo 校验完成（个别坏实例不影响指定实例的评测
 if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
     log_step "Step 3: 准备 Docker 镜像"
 
-    if [[ "$HAS_BUILDX" == "true" ]]; then
+    # 先检查指定实例的镜像是否已存在本地
+    IMAGES_READY=true
+    if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+        for id in "${INSTANCE_IDS[@]}"; do
+            IMAGE_TAG=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
+            # 先查本地构建的镜像名（无 namespace）
+            LOCAL_IMAGE="sweb.eval.x86_64.${IMAGE_TAG}:latest"
+            # 再查 Docker Hub 拉取的镜像名（有 namespace）
+            HUB_IMAGE="swebench/sweb.eval.x86_64.${IMAGE_TAG}:latest"
+            if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${LOCAL_IMAGE}$"; then
+                log_info "镜像已存在（本地构建）: ${LOCAL_IMAGE}"
+            elif docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${HUB_IMAGE}$"; then
+                log_info "镜像已存在（Docker Hub 拉取）: ${HUB_IMAGE}"
+            else
+                log_info "镜像不存在: ${LOCAL_IMAGE} 或 ${HUB_IMAGE}"
+                IMAGES_READY=false
+            fi
+        done
+    fi
+
+    if [[ "$IMAGES_READY" == "true" ]]; then
+        log_info "所有指定实例的镜像已就绪，跳过构建/拉取"
+    elif [[ "$HAS_BUILDX" == "true" ]]; then
         # 有 buildx：从 Task Repo 本地构建
         log_info "从 Task Repo 构建 Docker 镜像（可能需要较长时间）..."
         log_info "构建参数: -j ${EVAL_WORKERS}"
@@ -304,6 +326,13 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
             done
             uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}" "${BUILD_INSTANCE_ARGS[@]}" || {
                 log_warn "部分镜像构建失败，将尝试从 Docker Hub 拉取"
+                # 构建失败时尝试从 Docker Hub 拉取
+                for id in "${INSTANCE_IDS[@]}"; do
+                    IMAGE_TAG=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
+                    HUB_IMAGE="swebench/sweb.eval.x86_64.${IMAGE_TAG}:latest"
+                    log_info "尝试拉取: ${HUB_IMAGE}"
+                    docker pull "${HUB_IMAGE}" || log_warn "拉取失败: ${HUB_IMAGE}"
+                done
             }
         else
             uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}" || {
@@ -315,7 +344,6 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
         # 无 buildx：直接从 Docker Hub 拉取预构建镜像
         log_info "从 Docker Hub 拉取预构建镜像..."
 
-        # 确定需要拉取的镜像名
         # 镜像名格式: swebench/sweb.eval.x86_64.<instance_id>:latest
         # 其中 instance_id 的 __ 替换为 _1776_，全小写（见 swebench/task/checks.py:68-69）
         if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
@@ -334,6 +362,23 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
     fi
 else
     log_step "Step 3: 跳过镜像准备（--skip-build 或 --infer-only）"
+    # --skip-build 时仍检查镜像是否已存在，供 Step 6 决定是否传 --task-repo
+    IMAGES_READY=false
+    if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+        IMAGES_READY=true
+        for id in "${INSTANCE_IDS[@]}"; do
+            IMAGE_TAG=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
+            LOCAL_IMAGE="sweb.eval.x86_64.${IMAGE_TAG}:latest"
+            HUB_IMAGE="swebench/sweb.eval.x86_64.${IMAGE_TAG}:latest"
+            if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${LOCAL_IMAGE}$"; then
+                :
+            elif docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${HUB_IMAGE}$"; then
+                :
+            else
+                IMAGES_READY=false
+            fi
+        done
+    fi
 fi
 
 #==============================================================================
@@ -369,6 +414,16 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     log_step "Step 5: 推理（mini-SWE-agent 调用本地模型）"
 
     mkdir -p "${OUTPUT_DIR}"
+
+    # 清理上次的预测文件，避免 mini-SWE-agent 跳过已存在实例
+    if [[ -f "${OUTPUT_DIR}/preds.json" ]] || [[ -f "${OUTPUT_DIR}/preds.jsonl" ]]; then
+        log_warn "发现上次的预测文件，备份后清理（避免 mini-SWE-agent 跳过已存在实例）"
+        BACKUP_DIR="${OUTPUT_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "${BACKUP_DIR}"
+        cp "${OUTPUT_DIR}"/preds.json* "${BACKUP_DIR}/" 2>/dev/null || true
+        rm -f "${OUTPUT_DIR}/preds.json" "${OUTPUT_DIR}/preds.jsonl"
+        log_info "旧预测文件已备份到: ${BACKUP_DIR}"
+    fi
 
     log_info "数据集: ${DATASET} (split: ${SPLIT})"
     log_info "模型 API: ${API_BASE}"
@@ -480,13 +535,30 @@ if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
 fi
 
 # 构造评测命令
-# 有 buildx 时用 --task-repo 本地构建；无 buildx 时不传 --task-repo，从 Docker Hub 拉取
+# 有 buildx 且镜像从 task repo 本地构建时用 --task-repo
+# 镜像从 Docker Hub 拉取时不传 --task-repo，评测时用本地已有镜像或自动拉取
 EVAL_TASK_REPO_ARGS=()
-if [[ "$HAS_BUILDX" == "true" ]]; then
-    log_info "Task Repo: ${TASK_REPO_DIR}（本地构建镜像）"
-    EVAL_TASK_REPO_ARGS+=(--task-repo "${TASK_REPO_DIR}")
+if [[ "$HAS_BUILDX" == "true" ]] && [[ "$IMAGES_READY" == "true" ]]; then
+    # 检查镜像是本地构建的（无 swebench/ namespace）还是从 Docker Hub 拉取的
+    LOCAL_BUILD=true
+    if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+        for id in "${INSTANCE_IDS[@]}"; do
+            IMAGE_TAG=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
+            LOCAL_IMAGE="sweb.eval.x86_64.${IMAGE_TAG}:latest"
+            if ! docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${LOCAL_IMAGE}$"; then
+                LOCAL_BUILD=false
+                break
+            fi
+        done
+    fi
+    if [[ "$LOCAL_BUILD" == "true" ]]; then
+        log_info "Task Repo: ${TASK_REPO_DIR}（本地构建镜像，传 --task-repo）"
+        EVAL_TASK_REPO_ARGS+=(--task-repo "${TASK_REPO_DIR}")
+    else
+        log_info "镜像来自 Docker Hub（不传 --task-repo，使用本地已有镜像）"
+    fi
 else
-    log_info "镜像来源: Docker Hub（不传 --task-repo，评测时自动拉取）"
+    log_info "镜像来源: Docker Hub（不传 --task-repo，使用本地已有镜像或自动拉取）"
 fi
 
 echo ""
