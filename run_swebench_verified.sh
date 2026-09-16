@@ -13,25 +13,37 @@ set -euo pipefail
 #   - 已安装 Docker 且 daemon 正在运行
 #
 # 用法：
-#   1. 修改下方 =====配置区===== 中的变量
-#   2. ./run_swebench_verified.sh
+#   1. 直接修改下方配置区的默认值，然后: ./run_swebench_verified.sh
+#   2. 或通过命令行参数覆盖（无需改脚本），如:
+#      ./run_swebench_verified.sh \
+#        --api-url http://10.201.149.90/sp-sglang-agg-dsv4-flash-h1-49ee53b6 \
+#        --model-name my-model \
+#        --instance sympy__sympy-20590
 #
-# 可选参数：
+#   可选参数：
 #   --skip-install      跳过安装步骤（已安装过时使用）
 #   --skip-build        跳过 Docker 镜像预构建
 #   --infer-only        仅运行推理，不评测
 #   --eval-only         仅运行评测（已有预测文件时使用）
 #   --instance <id>     仅测试指定实例（如 --instance sympy__sympy-20590，可重复）
+#   --api-url <url>     模型 API 地址（不带 /v1），覆盖配置区默认值
+#   --model-name <name> 模型名称，覆盖配置区默认值
+#   --api-key <key>     API Key，覆盖配置区默认值
+#   --dataset <name>    数据集（verified|lite|full|multimodal|multilingual）
+#   --infer-workers <n> 推理并发数
+#   --eval-workers <n>  评测并发数
 #==============================================================================
 
 # ============================ 配置区（按需修改） ===============================
 
-# GPU 机器上 vLLM 服务的地址和端口
-GPU_HOST="10.0.0.100"              # <-- 改成你的 GPU 机器 IP
-GPU_PORT="8000"                    # <-- 改成你的 vLLM 端口（默认 8000）
+# 模型 API 地址（不带 /v1，脚本会自动拼接）
+# 示例：
+#   有端口：    http://10.0.0.100:8000
+#   无端口：    http://10.201.149.90/sp-sglang-agg-dsv4-flash-h1-49ee53b6
+API_URL="http://127.0.0.1:8080"  # <-- 改成你的 API 地址
 
 # 模型名称（需与 vLLM 启动时 --served-model-name 一致）
-MODEL_NAME="my-local-model"        # <-- 改成你的模型名
+MODEL_NAME="glm-5.2"                # <-- 改成你的模型名
 
 # API Key（vLLM 默认不校验，设占位即可；若设了 token 鉴权则填真实 key）
 API_KEY="EMPTY"                    # <-- 如有鉴权则改
@@ -52,8 +64,8 @@ OUTPUT_DIR="${WORK_DIR}/outputs"
 PRED_FILE="${OUTPUT_DIR}/preds.jsonl"
 
 # Run ID（同一 run_id 的已完成实例会跳过，重测需改名字）
-RUN_ID_INFER="my-local-model-$(date +%Y%m%d_%H%M%S)"
-RUN_ID_EVAL="my-local-model-eval-$(date +%Y%m%d_%H%M%S)"
+RUN_ID_INFER="${MODEL_NAME}-$(date +%Y%m%d_%H%M%S)"
+RUN_ID_EVAL="${MODEL_NAME}-eval-$(date +%Y%m%d_%H%M%S)"
 
 # 数据集
 DATASET="verified"                 # verified | lite | full | multimodal | multilingual
@@ -84,21 +96,44 @@ EVAL_ONLY=false
 INSTANCE_IDS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-install)  SKIP_INSTALL=true;  shift;;
-        --skip-build)    SKIP_BUILD=true;    shift;;
-        --infer-only)    INFER_ONLY=true;    shift;;
-        --eval-only)     EVAL_ONLY=true;     shift;;
-        --instance)      INSTANCE_IDS+=("$2"); shift 2;;
+        --skip-install)    SKIP_INSTALL=true;    shift;;
+        --skip-build)      SKIP_BUILD=true;      shift;;
+        --infer-only)      INFER_ONLY=true;      shift;;
+        --eval-only)       EVAL_ONLY=true;       shift;;
+        --instance)        INSTANCE_IDS+=("$2"); shift 2;;
+        --api-url)         API_URL="$2";         shift 2;;
+        --model-name)      MODEL_NAME="$2";      shift 2;;
+        --api-key)         API_KEY="$2";         shift 2;;
+        --dataset)         DATASET="$2";         shift 2;;
+        --infer-workers)   INFER_WORKERS="$2";   shift 2;;
+        --eval-workers)    EVAL_WORKERS="$2";    shift 2;;
         --help|-h)
-            echo "用法: bash run_swebench_verified.sh [选项]"
+            echo "用法: ./run_swebench_verified.sh [选项]"
             echo ""
             echo "选项:"
-            echo "  --skip-install    跳过安装步骤"
-            echo "  --skip-build      跳过 Docker 镜像预构建"
-            echo "  --infer-only      仅运行推理"
-            echo "  --eval-only       仅运行评测（使用已有预测文件）"
-            echo "  --instance <id>   仅测试指定实例（可重复）"
-            echo "  --help            显示帮助"
+            echo "  --api-url <url>      模型 API 地址（不带 /v1），覆盖默认值"
+            echo "  --model-name <name>  模型名称，覆盖默认值"
+            echo "  --api-key <key>      API Key，覆盖默认值"
+            echo "  --dataset <name>     数据集（verified|lite|full|multimodal|multilingual）"
+            echo "  --infer-workers <n>  推理并发数"
+            echo "  --eval-workers <n>   评测并发数"
+            echo "  --skip-install       跳过安装步骤"
+            echo "  --skip-build         跳过 Docker 镜像预构建"
+            echo "  --infer-only         仅运行推理"
+            echo "  --eval-only          仅运行评测（使用已有预测文件）"
+            echo "  --instance <id>      仅测试指定实例（可重复）"
+            echo "  --help               显示帮助"
+            echo ""
+            echo "示例:"
+            echo "  # 用命令行参数覆盖默认配置"
+            echo "  ./run_swebench_verified.sh \\"
+            echo "    --api-url http://10.201.149.90/sp-sglang-agg-dsv4-flash-h1-49ee53b6 \\"
+            echo "    --model-name my-model \\"
+            echo "    --instance sympy__sympy-20590"
+            echo ""
+            echo "  # 后台运行单实例验证"
+            echo "  nohup ./run_swebench_verified.sh --api-url http://10.0.0.100:8000 \\"
+            echo "    --model-name my-model --instance sympy__sympy-20590 > run.log 2>&1 &"
             exit 0;;
         *)
             log_error "未知参数: $1"; exit 1;;
@@ -111,7 +146,17 @@ for id in "${INSTANCE_IDS[@]:-}"; do
     [[ -n "$id" ]] && INSTANCE_ARGS+=("-i" "$id")
 done
 
-API_URL="http://${GPU_HOST}:${GPU_PORT}/v1"
+API_URL="${API_URL%/}"  # 去掉末尾斜杠，避免拼接时出现 //
+API_BASE="${API_URL}/v1"  # 完整 API 地址（带 /v1）
+
+# 打印最终生效的配置
+log_step "配置信息"
+log_info "  API_URL:      ${API_URL}"
+log_info "  API_BASE:     ${API_BASE}"
+log_info "  MODEL_NAME:   ${MODEL_NAME}"
+log_info "  DATASET:      ${DATASET}"
+log_info "  INFER_WORKERS:${INFER_WORKERS}"
+log_info "  EVAL_WORKERS: ${EVAL_WORKERS}"
 
 #==============================================================================
 # Step 0: 环境检查
@@ -163,12 +208,12 @@ else
 fi
 
 # 检查 GPU 机器 API 是否可达
-log_info "检查 GPU 机器 API (${API_URL}) ..."
-if curl -sf --max-time 10 "${API_URL}/models" -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; then
+log_info "检查 GPU 机器 API (${API_BASE}) ..."
+if curl -sf --max-time 10 "${API_BASE}/models" -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; then
     log_info "GPU 机器 API 可达"
-    curl -sf --max-time 10 "${API_URL}/models" -H "Authorization: Bearer ${API_KEY}" 2>/dev/null | uv run python -m json.tool 2>/dev/null | head -20 || true
+    curl -sf --max-time 10 "${API_BASE}/models" -H "Authorization: Bearer ${API_KEY}" 2>/dev/null | uv run python -m json.tool 2>/dev/null | head -20 || true
 else
-    log_warn "无法连接到 GPU 机器 API (${API_URL})"
+    log_warn "无法连接到 GPU 机器 API (${API_BASE})"
     log_warn "请确认：1) vLLM 已启动  2) IP/端口正确  3) 网络可达  4) 防火墙放行"
     log_warn "继续执行（推理步骤会失败报错）..."
 fi
@@ -268,7 +313,7 @@ cat > "${MODEL_CONFIG}" <<EOF
 # mini-SWE-agent 模型配置（自动生成）
 # litellm 格式：openai/ 前缀表示走 OpenAI 兼容接口
 model: openai/${MODEL_NAME}
-api_base: ${API_URL}
+api_base: ${API_BASE}
 api_key: ${API_KEY}
 # 采样参数（litellm 会透传给 vLLM 的 /v1/chat/completions）
 temperature: ${TEMPERATURE}
@@ -281,7 +326,7 @@ cat "${MODEL_CONFIG}"
 
 # 同时设置环境变量（litellm 也会读取）
 export OPENAI_API_KEY="${API_KEY}"
-export OPENAI_BASE_URL="${API_URL}"
+export OPENAI_BASE_URL="${API_BASE}"
 
 #==============================================================================
 # Step 5: 推理 - 调用本地模型生成补丁
@@ -292,7 +337,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     mkdir -p "${OUTPUT_DIR}"
 
     log_info "数据集: ${DATASET} (split: ${SPLIT})"
-    log_info "模型 API: ${API_URL}"
+    log_info "模型 API: ${API_BASE}"
     log_info "模型名: ${MODEL_NAME}"
     log_info "推理并发: ${INFER_WORKERS}"
     log_info "Run ID: ${RUN_ID_INFER}"
@@ -334,7 +379,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
             log_error "请检查："
             log_error "  1. GPU 机器 vLLM 服务是否正常"
             log_error "  2. 模型名 '${MODEL_NAME}' 是否与 vLLM --served-model-name 一致"
-            log_error "  3. 网络是否可达 ${API_URL}"
+            log_error "  3. 网络是否可达 ${API_BASE}"
             log_error "  4. 推理日志: logs/inference/${RUN_ID_INFER}/"
             exit 1
         }
