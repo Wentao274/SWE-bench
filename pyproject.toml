@@ -48,13 +48,13 @@ datasets = [
     "transformers",
     "openai",
     "anthropic",
-    "litellm>=1.85.0,<2.0",
+    "litellm>=1.85.0,<1.90.0",
     "jedi",
 ]
 inference = [
     "torch>=2.0.0",
     "anthropic",
-    "litellm>=1.85.0,<2.0",
+    "litellm>=1.85.0,<1.90.0",
     "jedi",
     "openai",
     "peft",
@@ -89,6 +89,11 @@ dev = [
     "pytest",
     "pytest-cov",
 ]
+
+# Pin litellm to a version compatible with mini-SWE-agent 2.4.6
+# (litellm 1.98.0 removed litellm.exceptions, which mini-SWE-agent relies on)
+[tool.uv]
+constraint-dependencies = ["litellm>=1.85.0,<1.90.0"]
 
 [tool.setuptools]
 include-package-data = true

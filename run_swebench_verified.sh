@@ -237,6 +237,8 @@ if [[ "$SKIP_INSTALL" == "false" ]]; then
     log_info "  - dev 组（默认安装）: mini-swe-agent + pytest"
     log_info "  --extra datasets: openai + anthropic + litellm + tiktoken 等"
 
+    # 重新解析依赖，确保 litellm 版本兼容 mini-SWE-agent
+    uv lock --extra datasets 2>/dev/null || true
     uv sync --extra datasets || {
         log_error "uv sync 失败！"
         log_error "尝试: uv sync --extra datasets --no-lockfile"
@@ -249,6 +251,8 @@ if [[ "$SKIP_INSTALL" == "false" ]]; then
     log_info "验证安装..."
     uv run swebench --version 2>/dev/null || uv run python -c "import swebench; print(swebench.__version__)" || true
     uv run python -c "import minisweagent; print('mini-SWE-agent OK')" || log_warn "mini-SWE-agent 导入失败，推理步骤可能出错"
+    # 检查 litellm 版本兼容性
+    uv run python -c "import litellm; assert hasattr(litellm, 'exceptions'), f'litellm {litellm.__version__} 缺少 exceptions 模块，不兼容 mini-SWE-agent'; print(f'litellm {litellm.__version__} OK')" || log_warn "litellm 版本可能不兼容 mini-SWE-agent"
 else
     log_step "Step 1: 跳过安装（--skip-install）"
 fi
