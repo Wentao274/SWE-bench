@@ -23,6 +23,7 @@ set -euo pipefail
 #   可选参数：
 #   --skip-install      跳过安装步骤（已安装过时使用）
 #   --skip-build        跳过 Docker 镜像预构建
+#   --build-local       全量评测时强制本地构建镜像（Docker Hub 不可达时使用）
 #   --infer-only        仅运行推理，不评测
 #   --eval-only         仅运行评测（已有预测文件时使用）
 #   --instance <id>     仅测试指定实例（如 --instance sympy__sympy-20590，可重复）
@@ -91,6 +92,7 @@ log_step()  { echo -e "\n${BLUE}========== $* ==========${NC}"; }
 # 解析命令行参数
 SKIP_INSTALL=false
 SKIP_BUILD=false
+BUILD_LOCAL=false
 INFER_ONLY=false
 EVAL_ONLY=false
 INSTANCE_IDS=()
@@ -98,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-install)    SKIP_INSTALL=true;    shift;;
         --skip-build)      SKIP_BUILD=true;      shift;;
+        --build-local)     BUILD_LOCAL=true;     shift;;
         --infer-only)      INFER_ONLY=true;      shift;;
         --eval-only)       EVAL_ONLY=true;       shift;;
         --instance)        INSTANCE_IDS+=("$2"); shift 2;;
@@ -119,6 +122,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --eval-workers <n>   评测并发数"
             echo "  --skip-install       跳过安装步骤"
             echo "  --skip-build         跳过 Docker 镜像预构建"
+            echo "  --build-local        全量评测时本地构建镜像（Docker Hub 不可达时用）"
             echo "  --infer-only         仅运行推理"
             echo "  --eval-only          仅运行评测（使用已有预测文件）"
             echo "  --instance <id>      仅测试指定实例（可重复）"
@@ -296,12 +300,32 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
     # 镜像命名规则（见 swebench/image_builder/image_spec.py:37-44）:
     # - 本地构建（namespace=None）：sweb.eval.x86_64.<instance_id>:latest（保留 __，小写）
     # - Docker Hub（namespace=swebench）：swebench/sweb.eval.x86_64.<id_with_1776>:latest（__ → _1776_，小写）
+    #
+    # 重要：swebench eval --task-repo 会用 force_rebuild=True 重建所有镜像，
+    # 所以全量评测默认从 Docker Hub 拉取（更快），只在 --build-local 时才本地构建。
+    # 策略：
+    #   - 指定了 --instance（少量实例）：Step 3 预构建，Step 6 不传 --task-repo 直接用
+    #   - 全量评测（无 --instance）：默认从 Docker Hub 拉取；--build-local 时传 --task-repo 本地构建
 
-    # 检查指定实例的镜像是否已存在本地
     # IMAGES_SOURCE: "local"=本地构建, "hub"=Docker Hub拉取, "missing"=不存在
     IMAGES_READY=false
     IMAGES_SOURCE="missing"
-    if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+
+    if [[ ${#INSTANCE_IDS[@]} -eq 0 ]]; then
+        # 全量评测
+        if [[ "$BUILD_LOCAL" == "true" ]] && [[ "$HAS_BUILDX" == "true" ]]; then
+            # 用户显式要求本地构建（Docker Hub 不可达）
+            log_info "全量评测 + --build-local：Step 6 将用 --task-repo 本地构建 500 个镜像"
+            log_info "警告：本地构建 500 个镜像可能需要数小时"
+            IMAGES_SOURCE="local"
+        else
+            # 默认：从 Docker Hub 拉取（评测时按需自动拉取）
+            log_info "全量评测：评测时从 Docker Hub 按需拉取 500 个镜像"
+            log_info "提示：如 Docker Hub 不可达，加 --build-local 本地构建"
+            IMAGES_SOURCE="hub"
+        fi
+    else
+        # 指定实例：检查镜像是否已存在
         IMAGES_READY=true
         for id in "${INSTANCE_IDS[@]}"; do
             ID_LOWER=$(echo "${id}" | tr '[:upper:]' '[:lower:]')
@@ -322,57 +346,51 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
                 IMAGES_SOURCE="missing"
             fi
         done
-    fi
 
-    if [[ "$IMAGES_READY" == "true" ]]; then
-        log_info "所有指定实例的镜像已就绪，跳过构建/拉取"
-    elif [[ "$HAS_BUILDX" == "true" ]]; then
-        # 有 buildx：从 Task Repo 本地构建
-        log_info "从 Task Repo 构建 Docker 镜像（可能需要较长时间）..."
-        log_info "构建参数: -j ${EVAL_WORKERS}"
-        if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+        if [[ "$IMAGES_READY" == "true" ]]; then
+            log_info "所有指定实例的镜像已就绪，跳过构建/拉取"
+        elif [[ "$HAS_BUILDX" == "true" ]]; then
+            # 有 buildx：从 Task Repo 本地构建
+            log_info "从 Task Repo 构建 Docker 镜像..."
+            log_info "构建参数: -j ${EVAL_WORKERS}"
             BUILD_INSTANCE_ARGS=()
             for id in "${INSTANCE_IDS[@]}"; do
                 BUILD_INSTANCE_ARGS+=("-i" "$id")
             done
             uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}" "${BUILD_INSTANCE_ARGS[@]}"
-        else
-            uv run swebench images build "${TASK_REPO_DIR}" -j "${EVAL_WORKERS}"
-        fi
-        # swebench images build 即使构建失败也返回 0，需要重新检查镜像是否存在
-        log_info "重新检查镜像是否构建成功..."
-        IMAGES_READY=true
-        IMAGES_SOURCE="local"
-        for id in "${INSTANCE_IDS[@]}"; do
-            ID_LOWER=$(echo "${id}" | tr '[:upper:]' '[:lower:]')
-            LOCAL_IMAGE="sweb.eval.x86_64.${ID_LOWER}:latest"
-            if ! docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${LOCAL_IMAGE}$"; then
-                log_warn "本地构建失败: ${LOCAL_IMAGE}"
-                IMAGES_READY=false
-            fi
-        done
-        # 本地构建失败时尝试从 Docker Hub 拉取
-        if [[ "$IMAGES_READY" == "false" ]]; then
-            log_warn "部分镜像本地构建失败，尝试从 Docker Hub 拉取..."
+            # swebench images build 即使构建失败也返回 0，需要重新检查镜像是否存在
+            log_info "重新检查镜像是否构建成功..."
             IMAGES_READY=true
-            IMAGES_SOURCE="hub"
+            IMAGES_SOURCE="local"
             for id in "${INSTANCE_IDS[@]}"; do
-                ID_1776=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
-                HUB_IMAGE="swebench/sweb.eval.x86_64.${ID_1776}:latest"
-                log_info "尝试拉取: ${HUB_IMAGE}"
-                if docker pull "${HUB_IMAGE}"; then
-                    log_info "拉取成功: ${HUB_IMAGE}"
-                else
-                    log_warn "拉取失败: ${HUB_IMAGE}"
+                ID_LOWER=$(echo "${id}" | tr '[:upper:]' '[:lower:]')
+                LOCAL_IMAGE="sweb.eval.x86_64.${ID_LOWER}:latest"
+                if ! docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${LOCAL_IMAGE}$"; then
+                    log_warn "本地构建失败: ${LOCAL_IMAGE}"
                     IMAGES_READY=false
                 fi
             done
-        fi
-    else
-        # 无 buildx：直接从 Docker Hub 拉取预构建镜像
-        log_info "从 Docker Hub 拉取预构建镜像..."
-        IMAGES_SOURCE="hub"
-        if [[ ${#INSTANCE_IDS[@]} -gt 0 ]]; then
+            # 本地构建失败时尝试从 Docker Hub 拉取
+            if [[ "$IMAGES_READY" == "false" ]]; then
+                log_warn "部分镜像本地构建失败，尝试从 Docker Hub 拉取..."
+                IMAGES_READY=true
+                IMAGES_SOURCE="hub"
+                for id in "${INSTANCE_IDS[@]}"; do
+                    ID_1776=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
+                    HUB_IMAGE="swebench/sweb.eval.x86_64.${ID_1776}:latest"
+                    log_info "尝试拉取: ${HUB_IMAGE}"
+                    if docker pull "${HUB_IMAGE}"; then
+                        log_info "拉取成功: ${HUB_IMAGE}"
+                    else
+                        log_warn "拉取失败: ${HUB_IMAGE}"
+                        IMAGES_READY=false
+                    fi
+                done
+            fi
+        else
+            # 无 buildx：直接从 Docker Hub 拉取预构建镜像
+            log_info "从 Docker Hub 拉取预构建镜像..."
+            IMAGES_SOURCE="hub"
             for id in "${INSTANCE_IDS[@]}"; do
                 ID_1776=$(echo "${id}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
                 IMAGE_NAME="swebench/sweb.eval.x86_64.${ID_1776}:latest"
@@ -381,9 +399,6 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
                     log_warn "拉取失败: ${IMAGE_NAME}，评测时会再次尝试"
                 }
             done
-        else
-            log_warn "未指定 --instance，跳过预拉取（全量评测时评测步骤会按需拉取）"
-            log_warn "建议先用 --instance 指定少量实例测试"
         fi
     fi
 else
@@ -623,6 +638,17 @@ if [[ -f "${RESULTS_FILE}" ]]; then
     echo "----------------------------------------"
     uv run python -m json.tool "${RESULTS_FILE}" 2>/dev/null || cat "${RESULTS_FILE}"
     echo "----------------------------------------"
+
+    # 提取得分
+    RESOLVED=$(uv run python -c "import json; print(json.load(open('${RESULTS_FILE}')).get('resolved_instances', 0))" 2>/dev/null)
+    TOTAL=$(uv run python -c "import json; print(json.load(open('${RESULTS_FILE}')).get('total_instances', 0))" 2>/dev/null)
+    if [[ -n "$RESOLVED" ]] && [[ -n "$TOTAL" ]] && [[ "$TOTAL" -gt 0 ]] 2>/dev/null; then
+        SCORE=$(uv run python -c "print(f'{$RESOLVED/$TOTAL*100:.1f}')" 2>/dev/null || echo "N/A")
+        echo ""
+        log_info "=========================================="
+        log_info "  得分: ${RESOLVED}/${TOTAL} = ${SCORE}%"
+        log_info "=========================================="
+    fi
 else
     log_warn "结果文件未找到: ${RESULTS_FILE}"
     log_info "请手动查看 logs/evaluation/${RUN_ID_EVAL}/ 目录"
