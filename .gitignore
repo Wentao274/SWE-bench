@@ -176,17 +176,27 @@ gold.*.json
 loose-ends.txt
 todo_later.txt
 
-# SWE-bench evaluation outputs
+# SWE-bench evaluation outputs (legacy top-level, kept for backward compat)
 /logs/
 /logs/inference/
 /logs/evaluation/
 /logs/build_images/
 
-# Inference outputs (predictions, trajectories)
+# Inference outputs (legacy top-level, kept for backward compat)
 /outputs/
 
-# Task repo (cloned by run_swebench_verified.sh)
+# Local test run outputs (local_results/<model>/<timestamp>/{outputs,logs}/)
+/local_results/
+
+# Task repo (cloned by run_swebench_verified_local.sh)
 /swe-bench-tasks/
 
-# Auto-generated model config (run_swebench_verified.sh)
+# Auto-generated model config (legacy top-level)
 /model_config.yaml
+
+# Jenkins build outputs (jenkins_output/<tester>/<build>/<chip>/<model>/<timestamp>/)
+/jenkins_output/
+
+# Jenkins local workspace artifacts (pulled from remote)
+/reports/
+/builds/

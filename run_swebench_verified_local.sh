@@ -13,9 +13,9 @@ set -euo pipefail
 #   - 已安装 Docker 且 daemon 正在运行
 #
 # 用法：
-#   1. 直接修改下方配置区的默认值，然后: ./run_swebench_verified.sh
+#   1. 直接修改下方配置区的默认值，然后: ./run_swebench_verified_local.sh
 #   2. 或通过命令行参数覆盖（无需改脚本），如:
-#      ./run_swebench_verified.sh \
+#      ./run_swebench_verified_local.sh \
 #        --api-url http://10.201.149.90/sp-sglang-agg-dsv4-flash-h1-49ee53b6 \
 #        --model-name my-model \
 #        --instance sympy__sympy-20590
@@ -61,12 +61,17 @@ EVAL_WORKERS=2                     # 评测并发数（建议 <= 0.75 * CPU 核�
 # 路径
 WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 TASK_REPO_DIR="${WORK_DIR}/swe-bench-tasks"
-OUTPUT_DIR="${WORK_DIR}/outputs"
+
+# 每次运行独立目录：local_results/<model>/<timestamp>/
+# 推理输出(outputs/)和评测日志(logs/)都在此目录下，互不覆盖
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="${WORK_DIR}/local_results/${MODEL_NAME}/${TIMESTAMP}"
+OUTPUT_DIR="${RUN_DIR}/outputs"
 PRED_FILE="${OUTPUT_DIR}/preds.jsonl"
 
 # Run ID（同一 run_id 的已完成实例会跳过，重测需改名字）
-RUN_ID_INFER="${MODEL_NAME}-$(date +%Y%m%d_%H%M%S)"
-RUN_ID_EVAL="${MODEL_NAME}-eval-$(date +%Y%m%d_%H%M%S)"
+RUN_ID_INFER="${MODEL_NAME}-${TIMESTAMP}"
+RUN_ID_EVAL="${MODEL_NAME}-eval-${TIMESTAMP}"
 
 # 数据集
 DATASET="verified"                 # verified | lite | full | multimodal | multilingual
@@ -74,6 +79,9 @@ SPLIT="test"
 
 # 每个实例超时（秒）
 EVAL_TIMEOUT=3600
+
+# 代理地址（用于 git clone、HuggingFace 数据集下载、docker pull；留空则不使用）
+PROXY_URL=""               # 例: http://10.201.136.68:1080
 
 # ============================ 配置区结束 =====================================
 
@@ -110,8 +118,10 @@ while [[ $# -gt 0 ]]; do
         --dataset)         DATASET="$2";         shift 2;;
         --infer-workers)   INFER_WORKERS="$2";   shift 2;;
         --eval-workers)    EVAL_WORKERS="$2";    shift 2;;
+        --pred-file)       PRED_FILE="$2";       shift 2;;
+        --proxy)           PROXY_URL="$2";       shift 2;;
         --help|-h)
-            echo "用法: ./run_swebench_verified.sh [选项]"
+            echo "用法: ./run_swebench_verified_local.sh [选项]"
             echo ""
             echo "选项:"
             echo "  --api-url <url>      模型 API 地址（不带 /v1），覆盖默认值"
@@ -120,6 +130,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --dataset <name>     数据集（verified|lite|full|multimodal|multilingual）"
             echo "  --infer-workers <n>  推理并发数"
             echo "  --eval-workers <n>   评测并发数"
+            echo "  --pred-file <path>   指定已有预测文件（--eval-only 时使用）"
+            echo "  --proxy <url>        HTTP/HTTPS 代理地址（用于 git clone、HuggingFace、docker pull）"
             echo "  --skip-install       跳过安装步骤"
             echo "  --skip-build         跳过 Docker 镜像预构建"
             echo "  --build-local        全量评测时本地构建镜像（Docker Hub 不可达时用）"
@@ -130,13 +142,13 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "示例:"
             echo "  # 用命令行参数覆盖默认配置"
-            echo "  ./run_swebench_verified.sh \\"
+            echo "  ./run_swebench_verified_local.sh \\"
             echo "    --api-url http://10.201.149.90/sp-sglang-agg-dsv4-flash-h1-49ee53b6 \\"
             echo "    --model-name my-model \\"
             echo "    --instance sympy__sympy-20590"
             echo ""
             echo "  # 后台运行单实例验证"
-            echo "  nohup ./run_swebench_verified.sh --api-url http://10.0.0.100:8000 \\"
+            echo "  nohup ./run_swebench_verified_local.sh --api-url http://10.0.0.100:8000 \\"
             echo "    --model-name my-model --instance sympy__sympy-20590 > run.log 2>&1 &"
             exit 0;;
         *)
@@ -161,6 +173,17 @@ log_info "  MODEL_NAME:   ${MODEL_NAME}"
 log_info "  DATASET:      ${DATASET}"
 log_info "  INFER_WORKERS:${INFER_WORKERS}"
 log_info "  EVAL_WORKERS: ${EVAL_WORKERS}"
+log_info "  RUN_DIR:      ${RUN_DIR}"
+log_info "  PROXY_URL:    ${PROXY_URL:-<none>}"
+
+# ---------- 设置代理(整个评测流程使用)----------
+if [[ -n "$PROXY_URL" ]]; then
+    export http_proxy="$PROXY_URL"
+    export https_proxy="$PROXY_URL"
+    export HTTP_PROXY="$PROXY_URL"
+    export HTTPS_PROXY="$PROXY_URL"
+    log_info "代理已设置: $PROXY_URL"
+fi
 
 #==============================================================================
 # Step 0: 环境检查
@@ -429,7 +452,8 @@ fi
 #==============================================================================
 log_step "Step 4: 生成模型配置"
 
-MODEL_CONFIG="${WORK_DIR}/model_config.yaml"
+mkdir -p "${RUN_DIR}"
+MODEL_CONFIG="${RUN_DIR}/model_config.yaml"
 
 cat > "${MODEL_CONFIG}" <<EOF
 # mini-SWE-agent 模型配置（自动生成）
@@ -454,6 +478,10 @@ export OPENAI_BASE_URL="${API_BASE}"
 # 忽略自定义模型的费用计算错误（模型不在 litellm 价格表中）
 export MSWEA_COST_TRACKING='ignore_errors'
 
+# 切换到运行目录，swebench 的 logs/ 会写在这里
+log_info "运行目录: ${RUN_DIR}"
+cd "${RUN_DIR}"
+
 #==============================================================================
 # Step 5: 推理 - 调用本地模型生成补丁
 #==============================================================================
@@ -461,16 +489,6 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     log_step "Step 5: 推理（mini-SWE-agent 调用本地模型）"
 
     mkdir -p "${OUTPUT_DIR}"
-
-    # 清理上次的预测文件，避免 mini-SWE-agent 跳过已存在实例
-    if [[ -f "${OUTPUT_DIR}/preds.json" ]] || [[ -f "${OUTPUT_DIR}/preds.jsonl" ]]; then
-        log_warn "发现上次的预测文件，备份后清理（避免 mini-SWE-agent 跳过已存在实例）"
-        BACKUP_DIR="${OUTPUT_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
-        mkdir -p "${BACKUP_DIR}"
-        cp "${OUTPUT_DIR}"/preds.json* "${BACKUP_DIR}/" 2>/dev/null || true
-        rm -f "${OUTPUT_DIR}/preds.json" "${OUTPUT_DIR}/preds.jsonl"
-        log_info "旧预测文件已备份到: ${BACKUP_DIR}"
-    fi
 
     log_info "数据集: ${DATASET} (split: ${SPLIT})"
     log_info "模型 API: ${API_BASE}"
@@ -518,7 +536,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
             log_error "  1. GPU 机器 vLLM 服务是否正常"
             log_error "  2. 模型名 '${MODEL_NAME}' 是否与 vLLM --served-model-name 一致"
             log_error "  3. 网络是否可达 ${API_BASE}"
-            log_error "  4. 推理日志: logs/inference/${RUN_ID_INFER}/"
+            log_error "  4. 推理日志: ${RUN_DIR}/logs/inference/${RUN_ID_INFER}/"
             exit 1
         }
 
@@ -535,7 +553,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     if [[ ! -f "${PRED_FILE}" ]] || [[ ! -s "${PRED_FILE}" ]]; then
         log_error "推理未生成有效预测文件！"
         log_error "  预测文件路径: ${PRED_FILE}"
-        log_error "  推理日志: logs/inference/${RUN_ID_INFER}/"
+        log_error "  推理日志: ${RUN_DIR}/logs/inference/${RUN_ID_INFER}/"
         log_error "  mini-SWE-agent 日志: ${OUTPUT_DIR}/minisweagent.log"
         exit 1
     fi
@@ -555,7 +573,7 @@ else
 
     if [[ ! -f "${PRED_FILE}" ]]; then
         log_error "预测文件不存在: ${PRED_FILE}"
-        log_error "请先运行推理，或通过环境变量 PRED_FILE 指定路径"
+        log_error "请先运行推理，或通过 --pred-file 指定路径"
         exit 1
     fi
 fi
@@ -566,7 +584,7 @@ fi
 if [[ "$INFER_ONLY" == "true" ]]; then
     log_step "Step 6: 跳过评测（--infer-only）"
     log_info "推理结果保存在: ${PRED_FILE}"
-    log_info "稍后可单独评测: bash run_swebench_verified.sh --eval-only"
+    log_info "稍后可单独评测: bash run_swebench_verified_local.sh --eval-only"
     exit 0
 fi
 
@@ -621,7 +639,7 @@ uv run swebench eval "${DATASET}" \
         log_error "请检查："
         log_error "  1. Docker 是否正常运行"
         log_error "  2. 磁盘空间是否充足"
-        log_error "  3. 评测日志: logs/evaluation/${RUN_ID_EVAL}/"
+        log_error "  3. 评测日志: ${RUN_DIR}/logs/evaluation/${RUN_ID_EVAL}/"
         exit 1
     }
 
@@ -630,7 +648,7 @@ uv run swebench eval "${DATASET}" \
 #==============================================================================
 log_step "Step 7: 评测结果"
 
-RESULTS_FILE="logs/evaluation/${RUN_ID_EVAL}/results.json"
+RESULTS_FILE="${RUN_DIR}/logs/evaluation/${RUN_ID_EVAL}/results.json"
 
 if [[ -f "${RESULTS_FILE}" ]]; then
     log_info "结果文件: ${RESULTS_FILE}"
@@ -651,17 +669,18 @@ if [[ -f "${RESULTS_FILE}" ]]; then
     fi
 else
     log_warn "结果文件未找到: ${RESULTS_FILE}"
-    log_info "请手动查看 logs/evaluation/${RUN_ID_EVAL}/ 目录"
+    log_info "请手动查看 ${RUN_DIR}/logs/evaluation/${RUN_ID_EVAL}/ 目录"
 fi
 
 echo ""
 log_info "评测完成！"
-log_info "  推理日志: logs/inference/${RUN_ID_INFER}/"
-log_info "  评测日志: logs/evaluation/${RUN_ID_EVAL}/"
+log_info "  运行目录: ${RUN_DIR}"
+log_info "  推理日志: ${RUN_DIR}/logs/inference/${RUN_ID_INFER}/"
+log_info "  评测日志: ${RUN_DIR}/logs/evaluation/${RUN_ID_EVAL}/"
 log_info "  汇总结果: ${RESULTS_FILE}"
 echo ""
 log_info "每个实例的详细结果在:"
-log_info "  logs/evaluation/${RUN_ID_EVAL}/<model_name>/<instance_id>/"
+log_info "  ${RUN_DIR}/logs/evaluation/${RUN_ID_EVAL}/<model_name>/<instance_id>/"
 log_info "    ├── report.json       单实例结果"
 log_info "    ├── test_output.txt    测试输出"
 log_info "    ├── run_instance.log   运行日志"
