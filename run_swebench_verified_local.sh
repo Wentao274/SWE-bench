@@ -337,14 +337,31 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ "$INFER_ONLY" == "false" ]]; then
     if [[ ${#INSTANCE_IDS[@]} -eq 0 ]]; then
         # 全量评测
         if [[ "$BUILD_LOCAL" == "true" ]] && [[ "$HAS_BUILDX" == "true" ]]; then
-            # 用户显式要求本地构建（Docker Hub 不可达）
-            log_info "全量评测 + --build-local：Step 6 将用 --task-repo 本地构建 500 个镜像"
-            log_info "警告：本地构建 500 个镜像可能需要数小时"
-            IMAGES_SOURCE="local"
+            # 抽样检查镜像是否已存在(检查第一个实例的镜像)
+            SAMPLE_ID=$(uv run python -c "
+from swebench.harness.utils import load_swebench_dataset
+ds = load_swebench_dataset('${DATASET}', split='${SPLIT:-test}')
+print(ds[0]['instance_id'])
+" 2>/dev/null || echo "")
+            if [[ -n "$SAMPLE_ID" ]]; then
+                ID_1776=$(echo "${SAMPLE_ID}" | sed 's/__/_1776_/g' | tr '[:upper:]' '[:lower:]')
+                HUB_IMAGE="swebench/sweb.eval.x86_64.${ID_1776}:latest"
+                if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${HUB_IMAGE}$"; then
+                    log_info "全量评测 + --build-local：镜像已存在,不传 --task-repo(避免删除已有镜像)"
+                    IMAGES_SOURCE="hub"
+                else
+                    log_info "全量评测 + --build-local：镜像不存在,Step 6 将用 --task-repo 本地构建 500 个镜像"
+                    log_info "警告：本地构建 500 个镜像可能需要数小时"
+                    IMAGES_SOURCE="local"
+                fi
+            else
+                log_info "全量评测 + --build-local：无法确定实例 ID,Step 6 将用 --task-repo 本地构建"
+                IMAGES_SOURCE="local"
+            fi
         else
-            # 默认：从 Docker Hub 拉取（评测时按需自动拉取）
-            log_info "全量评测：评测时从 Docker Hub 按需拉取 500 个镜像"
-            log_info "提示：如 Docker Hub 不可达，加 --build-local 本地构建"
+            # 默认：优先使用本地镜像，未找到时从 Docker Hub 拉取
+            log_info "全量评测：优先使用本地镜像,未找到时从 Docker Hub 按需拉取"
+            log_info "提示：如 Docker Hub 不可达且镜像未预拉取,加 --build-local 本地构建"
             IMAGES_SOURCE="hub"
         fi
     else
@@ -481,6 +498,17 @@ export MSWEA_COST_TRACKING='ignore_errors'
 # 切换到运行目录，swebench 的 logs/ 会写在这里
 log_info "运行目录: ${RUN_DIR}"
 cd "${RUN_DIR}"
+
+# ---------- Step 5/6: 保留代理但排除内网模型 API ----------
+# Step 5 仍需访问 HuggingFace(数据集加载)和 raw.githubusercontent.com(litellm 模型价格表),
+# 因此不 unset 代理,而是用 NO_PROXY 排除内网模型 API 的 host,使其直连。
+# Step 6 评测在 Docker 容器内跑测试,容器不继承宿主 shell 的代理环境变量,不受影响。
+if [[ -n "$PROXY_URL" ]]; then
+    API_HOST=$(echo "${API_BASE}" | sed -E 's|^https?://([^/]+)/.*|\1|')
+    export NO_PROXY="${API_HOST},localhost,127.0.0.1"
+    export no_proxy="${API_HOST},localhost,127.0.0.1"
+    log_info "代理保留,模型 API(${API_HOST})通过 NO_PROXY 直连"
+fi
 
 #==============================================================================
 # Step 5: 推理 - 调用本地模型生成补丁

@@ -26,7 +26,7 @@ pipeline {
         string(name: 'EVAL_TIMEOUT', defaultValue: '3600', description: '每个实例超时秒数(默认 3600)')
 
         // 镜像与流程控制
-        booleanParam(name: 'BUILD_LOCAL', defaultValue: false, description: '本地构建 Docker 镜像(Docker Hub 不可达时使用;否则从 Docker Hub 拉取)')
+        booleanParam(name: 'BUILD_LOCAL', defaultValue: false, description: '镜像不存在时本地构建(Docker Hub 不可达且镜像未预拉取时使用);镜像已存在时勾选无效(不会删除已有镜像)')
         booleanParam(name: 'SKIP_INSTALL', defaultValue: false, description: '跳过 uv sync 安装步骤(已安装过时使用)')
         booleanParam(name: 'SKIP_BUILD', defaultValue: false, description: '跳过 Docker 镜像构建/拉取(已有镜像时使用)')
         booleanParam(name: 'INFER_ONLY', defaultValue: false, description: '仅运行推理,不评测')

@@ -8,8 +8,8 @@
 - **需要 Docker 镜像** — SWE-bench Verified 的 500 个实例各有对应的 Docker 镜像
   (约 3-7GB/个)，评测时在容器中运行测试验证补丁
 - **两阶段执行** — 先推理(模型生成补丁)，再评测(Docker 容器验证补丁)
-- **镜像来源** — 默认从 Docker Hub 拉取预构建镜像(`swebench/sweb.eval.x86_64.*`)，
-  也可本地构建(`--build-local`)
+- **镜像来源** — 默认优先使用本地镜像,未找到时才从 Docker Hub 拉取;
+  也可本地构建(`--build-local`,仅在镜像不存在时才构建)
 - **结果为 JSON** — `swebench-results.json` 包含 resolved/total/score，
   邮件 stage 直接解析该文件
 
@@ -113,12 +113,12 @@ bash run_swebench_verified_local.sh \
     --model-name glm-5.2 \
     --instance sympy__sympy-20590
 
-# 全量评测(从 Docker Hub 拉取镜像)
+# 全量评测(优先使用本地镜像)
 bash run_swebench_verified_local.sh \
     --api-url http://10.201.149.47:8080 \
     --model-name glm-5.2
 
-# 全量评测 + 本地构建镜像(Docker Hub 不可达时)
+# 全量评测 + 本地构建镜像(镜像不存在时才构建;已存在则直接使用)
 bash run_swebench_verified_local.sh \
     --api-url http://10.201.149.47:8080 \
     --model-name glm-5.2 \
@@ -211,7 +211,7 @@ Jenkins 通过 ssh 远程到 `REMOTE_HOST`(默认 `10.201.132.50`)在 `WORK_DIR`
 | `INFER_WORKERS` | `--infer-workers` | `2` | 推理并发数 |
 | `EVAL_WORKERS` | `--eval-workers` | `2` | 评测并发数 |
 | `EVAL_TIMEOUT` | `--eval-timeout` | `3600` | 每实例超时秒数 |
-| `BUILD_LOCAL` | `--build-local` | `false` | 本地构建镜像(Docker Hub 不可达时) |
+| `BUILD_LOCAL` | `--build-local` | `false` | 镜像不存在时本地构建;镜像已存在时勾选无效(不会删除已有镜像) |
 | `SKIP_INSTALL` | `--skip-install` | `false` | 跳过 uv sync |
 | `SKIP_BUILD` | `--skip-build` | `false` | 跳过镜像构建/拉取 |
 | `INFER_ONLY` | `--infer-only` | `false` | 仅推理 |
@@ -235,7 +235,7 @@ Jenkins 通过 ssh 远程到 `REMOTE_HOST`(默认 `10.201.132.50`)在 `WORK_DIR`
 | 场景 | 策略 | 说明 |
 |------|------|------|
 | 全量评测(默认) | 优先本地镜像 | 评测时先查本地,未找到才从 Docker Hub 拉取;已预拉取时无需网络 |
-| 全量评测 + `BUILD_LOCAL` | 本地构建 | 传 `--task-repo`,会**删除并重建**已有镜像;Docker Hub 不可达时使用 |
+| 全量评测 + `BUILD_LOCAL` | 镜像不存在才构建 | 先抽样检查镜像是否已存在;已存在则不传 `--task-repo`(避免删除);不存在才本地构建 |
 | 指定实例 | 本地构建 → Docker Hub 拉取 | 有 buildx 时优先本地构建 |
 | `SKIP_BUILD` | 跳过 | 使用已有镜像 |
 
@@ -252,8 +252,9 @@ Jenkins 通过 ssh 远程到 `REMOTE_HOST`(默认 `10.201.132.50`)在 `WORK_DIR`
 ### 注意事项
 
 - `swebench images build` 即使构建失败也返回退出码 0 — 脚本会重新检查镜像是否存在
-- `swebench eval --task-repo` 会用 `force_rebuild=True` **删除并重建**所有镜像 — 仅用于 `BUILD_LOCAL` 模式
-  - ⚠️ 如果镜像已预拉取,**不要**使用 `BUILD_LOCAL`,否则会删除已拉取的镜像
+- `swebench eval --task-repo` 会用 `force_rebuild=True` **删除并重建**所有镜像
+  - 脚本已修复:`BUILD_LOCAL` 时先抽样检查镜像是否已存在,已存在则不传 `--task-repo`,避免删除
+  - 仅当镜像确实不存在时才传 `--task-repo` 触发本地构建
 - 每个评测容器的 Docker 客户端超时：1800s (`SWEBENCH_DOCKER_TIMEOUT`)
 - 全量评测需要约 200-400GB 磁盘空间(500 个镜像 × 3-7GB)
 
@@ -311,7 +312,10 @@ Jenkins 通过 ssh 远程到 `REMOTE_HOST`(默认 `10.201.132.50`)在 `WORK_DIR`
 - 环境检查 stage: 代理仅用于 `uv sync`
 - 运行测试 stage: 代理通过 `--proxy` 传给 `run_swebench_main.py`,再传给 `run_swebench.sh`
   - `run_swebench.sh` 将代理导出为 `http_proxy` / `https_proxy` / `HTTP_PROXY` / `HTTPS_PROXY`
-  - 覆盖整个评测流程(git clone、HuggingFace、docker pull 等)
+  - Step 0-4 环境准备阶段: 代理生效(git clone、HuggingFace 数据集加载、uv sync 等)
+  - Step 4 之后: **不 unset 代理**,改为设置 `NO_PROXY` 排除内网模型 API 的 host
+    - Step 5(推理): HuggingFace 数据集加载、litellm 模型价格表拉取走代理;模型 API 调用通过 `NO_PROXY` 直连
+    - Step 6(评测): Docker 容器不继承宿主 shell 代理环境变量,不受影响
 
 **本地脚本**: 通过 `--proxy` 参数或 `PROXY_URL` 环境变量配置:
 ```bash
@@ -369,7 +373,7 @@ docker info                  # 确认 daemon 运行
 ```
 
 Jenkins 环境检查 stage 会自动执行 `uv sync --extra datasets`。
-如需代理,脚本内置 `http://10.201.136.68:1080`(仅在 `uv sync` 时启用)。
+代理通过 `PROXY` 参数配置(默认 `http://10.201.136.68:1080`),仅用于环境准备阶段(Step 0-4)。
 
 ### litellm 版本约束
 
@@ -395,7 +399,7 @@ litellm 必须 `>=1.85.0,<1.90.0`(1.98.0 移除了 `litellm.exceptions`,
 | git clone 超时 | 配置 `--proxy` 参数;或手动克隆 swe-bench-tasks 到 WORK_DIR |
 | HuggingFace 数据集下载失败 | 配置 `--proxy` 参数;或设置 `HF_ENDPOINT=https://hf-mirror.com`;或预缓存数据集 |
 | docker pull 失败 | 配置 Docker 守护进程代理(见第 8 节);或预拉取所有镜像 |
-| `BUILD_LOCAL` 删除了已拉取的镜像 | ⚠️ `--build-local` 会删除并重建镜像;镜像已预拉取时**不要**使用此选项 |
+| `BUILD_LOCAL` 删除了已拉取的镜像 | 已修复:`BUILD_LOCAL` 时先检查镜像是否已存在,已存在则不传 `--task-repo`;如仍遇到,检查抽样逻辑是否命中正确镜像名 |
 
 ---
 
