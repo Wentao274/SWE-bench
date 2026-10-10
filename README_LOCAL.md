@@ -400,6 +400,43 @@ litellm 必须 `>=1.85.0,<1.90.0`(1.98.0 移除了 `litellm.exceptions`,
 | HuggingFace 数据集下载失败 | 配置 `--proxy` 参数;或设置 `HF_ENDPOINT=https://hf-mirror.com`;或预缓存数据集 |
 | docker pull 失败 | 配置 Docker 守护进程代理(见第 8 节);或预拉取所有镜像 |
 | `BUILD_LOCAL` 删除了已拉取的镜像 | 已修复:`BUILD_LOCAL` 时先检查镜像是否已存在,已存在则不传 `--task-repo`;如仍遇到,检查抽样逻辑是否命中正确镜像名 |
+| 模型服务崩溃后容器堆积 | 脚本已自动清理;Step 5 前清理上次残留,`trap EXIT` 兜底;手动清理见下方"残留容器清理" |
+
+### 残留容器清理
+
+模型服务崩溃时,mini-SWE-agent 的 `__del__` 析构不可靠(Python 进程被 kill 时不调用),
+推理容器(`sleep 2h`)不会被自动删除,导致容器堆积。脚本已内置两层清理:
+
+**自动清理时机**:
+1. **Step 5 前** — 清理上次运行可能残留的推理容器(`minisweagent-*`)
+2. **脚本退出时** (`trap EXIT`) — 清理本次运行残留的所有 SWE-bench 容器
+
+**安全匹配规则**(双重过滤,不误杀无关容器):
+
+| 容器类型 | 名称匹配 | 镜像匹配 | 说明 |
+|----------|----------|----------|------|
+| 推理容器 | `^minisweagent-[0-9a-f]{8}` | `sweb.eval.x86_64.*` | mini-SWE-agent 命名规则 + SWE-bench 镜像 |
+| 评测容器 | `^sweb.eval\..*\.${RUN_ID_EVAL}` | (名称已含 run_id,无需镜像匹配) | 精确到本次 run_id,不影响其他运行 |
+
+**手动清理**(脚本未覆盖的场景):
+
+```bash
+# 查看残留的推理容器
+docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' | \
+  grep -E '^minisweagent-[0-9a-f]{8}' | grep 'sweb.eval.x86_64.'
+
+# 清理所有残留推理容器
+docker ps -a --format '{{.Names}}' | \
+  grep -E '^minisweagent-[0-9a-f]{8}' | \
+  xargs -r docker rm -f
+
+# 清理特定 run_id 的评测容器(替换 <run_id>)
+docker ps -a --format '{{.Names}}' | \
+  grep -E "^sweb\.eval\..*\.<run_id>$" | \
+  xargs -r docker rm -f
+```
+
+> ⚠️ 不要用 `docker rm -f $(docker ps -aq)` 清理,会误杀无关容器。
 
 ---
 

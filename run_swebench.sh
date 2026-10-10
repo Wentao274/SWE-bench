@@ -37,6 +37,64 @@ set -o pipefail
 ROOT_PATH=$(cd "$(dirname "$0")"; pwd)
 cd "${ROOT_PATH}"
 
+# ---------- 残留容器清理 ----------
+# mini-SWE-agent 推理容器: 名为 minisweagent-<8hex>, 镜像为 sweb.eval.x86_64.*
+# swebench 评测容器: 名为 sweb.eval.<instance_id>.<run_id>, 镜像为 sweb.eval.x86_64.*
+# 清理时双重匹配(容器名前缀 + 镜像名), 避免误杀无关容器
+cleanup_swebench_containers() {
+    local scope="${1:-all}"
+    local removed=0
+
+    if [[ "$scope" == "infer" ]]; then
+        while IFS=$'\t' read -r name image; do
+            [[ -z "$name" ]] && continue
+            docker rm -f "$name" >/dev/null 2>&1 && {
+                log_warn "清理残留推理容器: $name (镜像: $image)"
+                ((removed++))
+            }
+        done < <(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | \
+                 grep -E '^minisweagent-[0-9a-f]{8}\s' | \
+                 grep -E 'sweb\.eval\.x86_64\.')
+    fi
+
+    if [[ "$scope" == "eval" ]] && [[ -n "${RUN_ID_EVAL:-}" ]]; then
+        while IFS=$'\t' read -r name image; do
+            [[ -z "$name" ]] && continue
+            docker rm -f "$name" >/dev/null 2>&1 && {
+                log_warn "清理残留评测容器: $name (run_id: ${RUN_ID_EVAL})"
+                ((removed++))
+            }
+        done < <(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | \
+                 grep -E "^sweb\.eval\..*\.${RUN_ID_EVAL}\s")
+    fi
+
+    if [[ "$scope" == "all" ]]; then
+        while IFS=$'\t' read -r name image; do
+            [[ -z "$name" ]] && continue
+            docker rm -f "$name" >/dev/null 2>&1 && {
+                log_warn "清理残留容器: $name (镜像: $image)"
+                ((removed++))
+            }
+        done < <(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | \
+                 grep -E '^minisweagent-[0-9a-f]{8}\s' | \
+                 grep -E 'sweb\.eval\.x86_64\.')
+        if [[ -n "${RUN_ID_EVAL:-}" ]]; then
+            while IFS=$'\t' read -r name image; do
+                [[ -z "$name" ]] && continue
+                docker rm -f "$name" >/dev/null 2>&1 && {
+                    log_warn "清理残留评测容器: $name (run_id: ${RUN_ID_EVAL})"
+                    ((removed++))
+                }
+            done < <(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | \
+                     grep -E "^sweb\.eval\..*\.${RUN_ID_EVAL}\s")
+        fi
+    fi
+
+    if [[ "$removed" -gt 0 ]]; then
+        log_info "共清理 ${removed} 个残留容器"
+    fi
+}
+
 # ---------- 从环境变量读取配置(带默认值)----------
 MODEL_NAME="${MODEL_NAME:-glm-5.2}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8080/v1}"
@@ -90,6 +148,9 @@ log_step()  { echo -e "\n${BLUE}========== $* ==========${NC}" | tee -a "$LOG_FI
 # ---------- Run ID ----------
 RUN_ID_INFER="${MODEL_NAME}-$(date +%Y%m%d_%H%M%S)"
 RUN_ID_EVAL="${MODEL_NAME}-eval-$(date +%Y%m%d_%H%M%S)"
+
+# ---------- 退出时清理残留容器(脚本异常终止时兜底) ----------
+trap 'cleanup_swebench_containers all' EXIT
 
 # ---------- 解析 INSTANCE_IDS ----------
 INSTANCE_ARGS=()
@@ -412,6 +473,11 @@ if [[ -n "$PROXY_URL" ]]; then
     export NO_PROXY="${API_HOST},localhost,127.0.0.1"
     export no_proxy="${API_HOST},localhost,127.0.0.1"
     log_info "代理保留,模型 API(${API_HOST})通过 NO_PROXY 直连"
+fi
+
+# ---------- Step 5 前清理上次运行可能残留的推理容器 ----------
+if [[ "$EVAL_ONLY" == "false" ]]; then
+    cleanup_swebench_containers infer
 fi
 
 #==============================================================================
